@@ -3,7 +3,13 @@ from abc import abstractmethod
 from enum import Enum
 from pathlib import Path
 from typing import Tuple, Union
+import types
 import numpy as np
+
+import ray
+from ray import tune
+from ray.tune.schedulers import HyperBandScheduler
+from ray.tune import Trainable
 
 from hyperopt import hp, fmin, tpe
 
@@ -45,7 +51,7 @@ class SearchSpace(object):
         return hp.choice("parameters", [self.search_space])
 
 
-class ParamSelector(object):
+class SequentialParamSelector(object):
     def __init__(
         self,
         corpus: Corpus,
@@ -177,101 +183,189 @@ class ParamSelector(object):
                 f.write(f"\t{k}: {str(v)}\n")
 
 
-class SequenceTaggerParamSelector(ParamSelector):
+class TuneParamSelector(Trainable):
+    def _setup(self, config):
+        args = config["args"]
+        config.pop("args", None)
+        self.params = config
+
+        torch.manual_seed(args["seed"])
+        if args.cuda:
+            torch.cuda.manual_seed(args["seed"])
+
+        model = args["_set_up_model"](self.params)
+
+        self.trainer = ModelTrainer(model, args["corpus"])
+
+        log_line(log)
+        log.info(f'Model: "{self.model}"')
+        log_line(log)
+        log.info(f'Corpus: "{self.corpus}"')
+        log_line(log)
+        log.info("Parameters:")
+        log.info(f' - learning_rate: "{learning_rate}"')
+        log.info(f' - mini_batch_size: "{mini_batch_size}"')
+        log.info(f' - patience: "{patience}"')
+        log.info(f' - anneal_factor: "{anneal_factor}"')
+        log.info(f' - max_epochs: "{max_epochs}"')
+        log.info(f' - shuffle: "{shuffle}"')
+
+
+
+    def _train_iteration(self):
+
+        pass
+
+    def _test(self):
+        pass
+
+    def _train(self):
+        self._train_iteration()
+        return self._test()
+
+    def _save(self, checkpoint_dir):
+        pass
+
+    def _restore(self, checkpoint_path):
+        pass
+
+
+class DistributedParamSelector(object):
     def __init__(
-        self,
+            self,
+            redis_address: str,
+            corpus: Corpus,
+            base_path: Union[str, Path],
+            max_epochs: int,
+            evaluation_metric: EvaluationMetric,
+            training_runs: int,
+            optimization_value: OptimizationValue,
+            use_gpu=torch.cuda.is_available(),
+    ):
+        self.corpus = corpus
+        self.max_epochs = max_epochs
+        self.base_path = base_path
+        self.evaluation_metric = evaluation_metric
+        self.training_runs = training_runs
+        self.optimization_value = optimization_value
+        self.use_gpu = use_gpu
+
+        ray.init(redis_address=redis_address)
+        self.hb_scheduler = HyperBandScheduler(
+            time_attr="training_iteration",
+            metric="mean_loss", mode="min"
+        )
+
+        # Config dictionary for Tune Param Selector
+        config, args = dict(), dict()
+        self.config = config
+        config["args"] = args
+        args["cuda"] = self.use_gpu
+        args["_set_up_model"] = self._set_up_model
+
+    def optimize(
+            self,
+            space: SearchSpace,
+            max_evals=100,
+            random_seed=1
+    ):
+        config = self.config
+        args = config["args"]
+        config.update(space.search_space)
+        args["max_evals"] = max_evals
+        args["seed"] = random_seed
+
+
+        tune.run(
+            TuneParamSelector,
+            scheduler=self.hb_scheduler,
+            **{
+                "stop": {
+                    "training_iteration": self.max_epochs,
+                },
+                "resources_per_trial": {
+                    "cpu": 3,
+                    "gpu": 1 if self.use_gpu else 0,
+                },
+                "num_samples": 20,
+                "checkpoint_at_end": True,
+                "config": config
+            })
+
+    @abstractmethod
+    def _set_up_model(self, params: dict) -> flair.nn.Model:
+        pass
+
+def ParamSelector(
         corpus: Corpus,
         tag_type: str,
         base_path: Union[str, Path],
         max_epochs: int = 50,
+        distributed=False,
+        model_type=SequenceTagger,
+        multi_label: bool = True,
+        document_embedding_type=None,
         evaluation_metric: EvaluationMetric = EvaluationMetric.MICRO_F1_SCORE,
         training_runs: int = 1,
         optimization_value: OptimizationValue = OptimizationValue.DEV_LOSS,
-    ):
-        """
-        :param corpus: the corpus
-        :param tag_type: tag type to use
-        :param base_path: the path to the result folder (results will be written to that folder)
-        :param max_epochs: number of epochs to perform on every evaluation run
-        :param evaluation_metric: evaluation metric used during training
-        :param training_runs: number of training runs per evaluation run
-        :param optimization_value: value to optimize
-        """
-        super().__init__(
-            corpus,
-            base_path,
-            max_epochs,
+):
+    param_selector = None
+    if distributed:
+        param_selector = DistributedParamSelector(
+            corpus, base_path,
             evaluation_metric,
             training_runs,
-            optimization_value,
+            optimization_value
         )
-
-        self.tag_type = tag_type
-        self.tag_dictionary = self.corpus.make_tag_dictionary(self.tag_type)
-
-    def _set_up_model(self, params: dict):
-        sequence_tagger_params = {
-            key: params[key] for key in params if key in SEQUENCE_TAGGER_PARAMETERS
-        }
-
-        tagger: SequenceTagger = SequenceTagger(
-            tag_dictionary=self.tag_dictionary,
-            tag_type=self.tag_type,
-            **sequence_tagger_params,
-        )
-        return tagger
-
-
-class TextClassifierParamSelector(ParamSelector):
-    def __init__(
-        self,
-        corpus: Corpus,
-        multi_label: bool,
-        base_path: Union[str, Path],
-        document_embedding_type: str,
-        max_epochs: int = 50,
-        evaluation_metric: EvaluationMetric = EvaluationMetric.MICRO_F1_SCORE,
-        training_runs: int = 1,
-        optimization_value: OptimizationValue = OptimizationValue.DEV_LOSS,
-    ):
-        """
-        :param corpus: the corpus
-        :param multi_label: true, if the dataset is multi label, false otherwise
-        :param base_path: the path to the result folder (results will be written to that folder)
-        :param document_embedding_type: either 'lstm', 'mean', 'min', or 'max'
-        :param max_epochs: number of epochs to perform on every evaluation run
-        :param evaluation_metric: evaluation metric used during training
-        :param training_runs: number of training runs per evaluation run
-        :param optimization_value: value to optimize
-        """
-        super().__init__(
-            corpus,
-            base_path,
-            max_epochs,
+    else:
+        param_selector = SequentialParamSelector(
+            corpus, base_path,
             evaluation_metric,
             training_runs,
-            optimization_value,
+            optimization_value
         )
 
-        self.multi_label = multi_label
-        self.document_embedding_type = document_embedding_type
-
-        self.label_dictionary = self.corpus.make_label_dictionary()
+    param_selector.model_type = model_type
 
     def _set_up_model(self, params: dict):
-        embdding_params = {
-            key: params[key] for key in params if key in DOCUMENT_EMBEDDING_PARAMETERS
+
+        if self.model_type == SequenceTagger:
+            parameter_set = SEQUENCE_TAGGER_PARAMETERS
+        elif self.model_type == TextClassifier:
+            parameter_set = DOCUMENT_EMBEDDING_PARAMETERS
+
+        model_params = {
+            key: params[key] for key in params if key in parameter_set
         }
 
-        if self.document_embedding_type == "lstm":
-            document_embedding = DocumentRNNEmbeddings(**embdding_params)
-        else:
-            document_embedding = DocumentPoolEmbeddings(**embdding_params)
+        if self.model_type == SequenceTagger:
 
-        text_classifier: TextClassifier = TextClassifier(
-            label_dictionary=self.label_dictionary,
-            multi_label=self.multi_label,
-            document_embeddings=document_embedding,
-        )
+            self.tag_type = tag_type
+            self.tag_dictionary = self.corpus.make_tag_dictionary(self.tag_type)
 
-        return text_classifier
+            model: SequenceTagger = SequenceTagger(
+                tag_dictionary=self.tag_dictionary,
+                tag_type=self.tag_type,
+                **model_params,
+            )
+        elif self.model_type == TextClassifier:
+
+            self.multi_label = multi_label
+            self.document_embedding_type = document_embedding_type
+
+            self.label_dictionary = self.corpus.make_label_dictionary()
+
+            if self.document_embedding_type == "lstm":
+                document_embedding = DocumentRNNEmbeddings(**model_params)
+            else:
+                document_embedding = DocumentPoolEmbeddings(**model_params)
+
+            model: TextClassifier = TextClassifier(
+                label_dictionary=self.label_dictionary,
+                multi_label=self.multi_label,
+                document_embeddings=document_embedding,
+            )
+        # We bind _set_up_model method to the appropriate ParamSelector class
+        # specified by model_type variable
+        param_selector._set_up_model = types.MethodType(_set_up_model, param_selector)
+        return param_selector
