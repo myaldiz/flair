@@ -105,14 +105,14 @@ class TextClassifier(flair.nn.Model):
     ) -> torch.tensor:
 
         scores = self.forward(data_points)
-        return self._calculate_loss(scores, data_points)
+        return self.calculate_loss(scores, data_points)
 
     def forward_labels_and_loss(
         self, sentences: Union[Sentence, List[Sentence]]
     ) -> (List[List[Label]], torch.tensor):
         scores = self.forward(sentences)
-        labels = self._obtain_labels(scores)
-        loss = self._calculate_loss(scores, sentences)
+        labels = self.obtain_labels(scores)
+        loss = self.calculate_loss(scores, sentences)
         return labels, loss
 
     def predict(
@@ -145,7 +145,7 @@ class TextClassifier(flair.nn.Model):
 
             for batch in batches:
                 scores = self.forward(batch)
-                predicted_labels = self._obtain_labels(
+                predicted_labels = self.obtain_labels(
                     scores, predict_prob=multi_class_prob
                 )
 
@@ -156,6 +156,63 @@ class TextClassifier(flair.nn.Model):
                 store_embeddings(batch, storage_mode=embedding_storage_mode)
 
             return sentences
+
+    def obtain_performance_metric(
+            self,
+            batch,
+            labels,
+            lines,
+            metric=Metric("Perf_Metric"),
+    ) -> Metric:
+        sentences_for_batch = [sent.to_plain_string() for sent in batch]
+        confidences_for_batch = [
+            [label.score for label in sent_labels] for sent_labels in labels
+        ]
+        predictions_for_batch = [
+            [label.value for label in sent_labels] for sent_labels in labels
+        ]
+        true_values_for_batch = [
+            sentence.get_label_names() for sentence in batch
+        ]
+        available_labels = self.label_dictionary.get_items()
+
+        for sentence, confidence, prediction, true_value in zip(
+                sentences_for_batch,
+                confidences_for_batch,
+                predictions_for_batch,
+                true_values_for_batch,
+        ):
+            eval_line = "{}\t{}\t{}\t{}\n".format(
+                sentence, true_value, prediction, confidence
+            )
+            lines.append(eval_line)
+
+        for predictions_for_sentence, true_values_for_sentence in zip(
+                predictions_for_batch, true_values_for_batch
+        ):
+
+            for label in available_labels:
+                if (
+                        label in predictions_for_sentence
+                        and label in true_values_for_sentence
+                ):
+                    metric.add_tp(label)
+                elif (
+                        label in predictions_for_sentence
+                        and label not in true_values_for_sentence
+                ):
+                    metric.add_fp(label)
+                elif (
+                        label not in predictions_for_sentence
+                        and label in true_values_for_sentence
+                ):
+                    metric.add_fn(label)
+                elif (
+                        label not in predictions_for_sentence
+                        and label not in true_values_for_sentence
+                ):
+                    metric.add_tn(label)
+        return metric
 
     def evaluate(
         self,
@@ -179,54 +236,7 @@ class TextClassifier(flair.nn.Model):
 
                 eval_loss += loss
 
-                sentences_for_batch = [sent.to_plain_string() for sent in batch]
-                confidences_for_batch = [
-                    [label.score for label in sent_labels] for sent_labels in labels
-                ]
-                predictions_for_batch = [
-                    [label.value for label in sent_labels] for sent_labels in labels
-                ]
-                true_values_for_batch = [
-                    sentence.get_label_names() for sentence in batch
-                ]
-                available_labels = self.label_dictionary.get_items()
-
-                for sentence, confidence, prediction, true_value in zip(
-                    sentences_for_batch,
-                    confidences_for_batch,
-                    predictions_for_batch,
-                    true_values_for_batch,
-                ):
-                    eval_line = "{}\t{}\t{}\t{}\n".format(
-                        sentence, true_value, prediction, confidence
-                    )
-                    lines.append(eval_line)
-
-                for predictions_for_sentence, true_values_for_sentence in zip(
-                    predictions_for_batch, true_values_for_batch
-                ):
-
-                    for label in available_labels:
-                        if (
-                            label in predictions_for_sentence
-                            and label in true_values_for_sentence
-                        ):
-                            metric.add_tp(label)
-                        elif (
-                            label in predictions_for_sentence
-                            and label not in true_values_for_sentence
-                        ):
-                            metric.add_fp(label)
-                        elif (
-                            label not in predictions_for_sentence
-                            and label in true_values_for_sentence
-                        ):
-                            metric.add_fn(label)
-                        elif (
-                            label not in predictions_for_sentence
-                            and label not in true_values_for_sentence
-                        ):
-                            metric.add_tn(label)
+                metric = self.obtain_performance_metric(batch, labels, lines, metric)
 
                 store_embeddings(batch, embeddings_storage_mode)
 
@@ -269,7 +279,7 @@ class TextClassifier(flair.nn.Model):
             )
         return filtered_sentences
 
-    def _calculate_loss(
+    def calculate_loss(
         self, scores: torch.tensor, sentences: List[Sentence]
     ) -> torch.tensor:
         """
@@ -283,7 +293,7 @@ class TextClassifier(flair.nn.Model):
 
         return self._calculate_single_label_loss(scores, sentences)
 
-    def _obtain_labels(
+    def obtain_labels(
         self, scores: List[List[float]], predict_prob: bool = False
     ) -> List[List[Label]]:
         """

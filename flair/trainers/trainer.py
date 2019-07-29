@@ -5,6 +5,7 @@ from typing import List, Union
 import datetime
 
 import torch
+import torch.nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.optim.sgd import SGD
 from torch.utils.data.dataset import ConcatDataset
@@ -21,6 +22,7 @@ from flair.training_utils import (
     add_file_handler,
     Result,
     store_embeddings,
+    Metric,
 )
 
 log = logging.getLogger("flair")
@@ -153,6 +155,7 @@ class ModelTrainer:
         # prepare loss logging file and set up header
         loss_txt = init_output_file(base_path, "loss.tsv")
 
+        # Why do we use weight_extractor ?
         weight_extractor = WeightExtractor(base_path)
 
         optimizer: torch.optim.Optimizer = self.optimizer(
@@ -189,11 +192,20 @@ class ModelTrainer:
         dev_loss_history = []
         train_loss_history = []
 
+        batch_loader = DataLoader(
+            train_data,
+            batch_size=mini_batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            sampler=sampler,
+        )
+
         # At any point you can hit Ctrl + C to break out of training early.
         try:
             previous_learning_rate = learning_rate
 
             for epoch in range(0 + self.epoch, max_epochs + self.epoch):
+                self.epoch = epoch
                 log_line(log)
 
                 # get new learning rate
@@ -218,67 +230,29 @@ class ModelTrainer:
                     log_line(log)
                     break
 
-                batch_loader = DataLoader(
-                    train_data,
-                    batch_size=mini_batch_size,
-                    shuffle=shuffle,
-                    num_workers=num_workers,
-                    sampler=sampler,
-                )
-
-                self.model.train()
-
-                train_loss: float = 0
-
-                seen_batches = 0
-                total_number_of_batches = len(batch_loader)
-
-                modulo = max(1, int(total_number_of_batches / 10))
-
-                # process mini-batches
-                for batch_no, batch in enumerate(batch_loader):
-
-                    loss = self.model.forward_loss(batch)
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
-                    optimizer.step()
-
-                    seen_batches += 1
-                    train_loss += loss.item()
-
-                    # depending on memory mode, embeddings are moved to CPU, GPU or deleted
-                    store_embeddings(batch, embeddings_storage_mode)
-
-                    if batch_no % modulo == 0:
-                        log.info(
-                            f"epoch {epoch + 1} - iter {batch_no}/{total_number_of_batches} - loss "
-                            f"{train_loss / seen_batches:.8f}"
-                        )
-                        iteration = epoch * total_number_of_batches + batch_no
-                        if not param_selection_mode:
-                            weight_extractor.extract_weights(
-                                self.model.state_dict(), iteration
-                            )
-
-                train_loss /= seen_batches
-
+                train_result, train_loss = self.train_epoch(epoch, batch_loader,
+                                                            optimizer, weight_extractor,
+                                                            embeddings_storage_mode,
+                                                            param_selection_mode)
                 self.model.eval()
 
                 log_line(log)
                 log.info(
-                    f"EPOCH {epoch + 1} done: loss {train_loss:.4f} - lr {learning_rate:.4f}"
+                    f"EPOCH {epoch + 1} done with lr {learning_rate:.4f}"
+                )
+                log.info(
+                    f"DEV : loss {train_loss} - score {train_result.main_score}"
                 )
 
                 if self.use_tensorboard:
                     writer.add_scalar("train_loss", train_loss, epoch + 1)
 
-                # anneal against train loss if training with dev, otherwise anneal against dev score
-                current_score = train_loss
-
                 # evaluate on train / dev / test split depending on training settings
                 result_line: str = ""
+                result_line += f"\t{train_result.log_line}"
+
+                # anneal against train loss if training with dev, otherwise anneal against dev score
+                current_score = train_loss
 
                 if log_train:
                     train_eval_result, train_loss = self.model.evaluate(
@@ -289,7 +263,11 @@ class ModelTrainer:
                         ),
                         embeddings_storage_mode=embeddings_storage_mode,
                     )
+                    result_line: str = ""
                     result_line += f"\t{train_eval_result.log_line}"
+                    log.info(
+                        f"DEV : loss {train_loss} - score {train_eval_result.main_score}"
+                    )
 
                     # depending on memory mode, embeddings are moved to CPU, GPU or deleted
                     store_embeddings(self.corpus.train, embeddings_storage_mode)
@@ -451,6 +429,83 @@ class ModelTrainer:
             "train_loss_history": train_loss_history,
             "dev_loss_history": dev_loss_history,
         }
+
+    def train_epoch(
+            self,
+            epoch,
+            batch_loader,
+            optimizer,
+            weight_extractor,
+            embeddings_storage_mode: str = "cpu",
+            param_selection_mode: bool = False,
+
+    ):
+        metric = Metric("Training")
+        train_loss: float = 0
+
+        seen_batches = 0
+        total_number_of_batches = len(batch_loader)
+
+        modulo = max(1, int(total_number_of_batches / 10))
+
+        # process mini-batches
+        for batch_no, batch in enumerate(batch_loader):
+
+            optimizer.zero_grad()
+            features = self.model.forward(batch)
+            loss = self.model.calculate_loss(features, batch)
+            tags, _ = self.model.obtain_labels(features, batch)
+
+            # TODO: fix this for text regression model
+            metric = self.model.obtain_performance_metric(batch, tags,
+                                                          metric=metric)
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
+            optimizer.step()
+
+            seen_batches += 1
+            train_loss += loss.item()
+
+            # depending on memory mode, embeddings are moved to CPU, GPU or deleted
+            store_embeddings(batch, embeddings_storage_mode)
+
+            if batch_no % modulo == 0:
+                log.info(
+                    f"epoch {epoch + 1} - iter {batch_no}/{total_number_of_batches} - loss "
+                    f"{train_loss / seen_batches:.6f} - running_score "
+                    f"{metric.micro_avg_f_score():.6f}"
+
+                )
+                iteration = epoch * total_number_of_batches + batch_no
+                if not param_selection_mode:
+                    weight_extractor.extract_weights(
+                        self.model.state_dict(), iteration
+                    )
+
+        train_loss /= seen_batches
+
+        detailed_result = (
+            f"\nMICRO_AVG: acc {metric.micro_avg_accuracy()} - f1-score {metric.micro_avg_f_score()}"
+            f"\nMACRO_AVG: acc {metric.macro_avg_accuracy()} - f1-score {metric.macro_avg_f_score()}"
+        )
+        for class_name in metric.get_classes():
+            detailed_result += (
+                f"\n{class_name:<10} tp: {metric.get_tp(class_name)} - fp: {metric.get_fp(class_name)} - "
+                f"fn: {metric.get_fn(class_name)} - tn: {metric.get_tn(class_name)} - precision: "
+                f"{metric.precision(class_name):.4f} - recall: {metric.recall(class_name):.4f} - "
+                f"accuracy: {metric.accuracy(class_name):.4f} - f1-score: "
+                f"{metric.f_score(class_name):.4f}"
+            )
+
+        result = Result(
+            main_score=metric.micro_avg_f_score(),
+            log_line=f"{metric.precision()}\t{metric.recall()}\t{metric.micro_avg_f_score()}",
+            log_header="PRECISION\tRECALL\tF1",
+            detailed_results=detailed_result,
+        )
+
+        return result, train_loss
 
     def final_test(
         self, base_path: Path, eval_mini_batch_size: int, num_workers: int = 8

@@ -71,7 +71,7 @@ class TextRegressor(flair.models.TextClassifier):
 
             return sentences
 
-    def _calculate_loss(
+    def calculate_loss(
         self, scores: torch.tensor, sentences: List[Sentence]
     ) -> torch.tensor:
         """
@@ -87,8 +87,40 @@ class TextRegressor(flair.models.TextClassifier):
     ) -> (List[List[float]], torch.tensor):
 
         scores = self.forward(sentences)
-        loss = self._calculate_loss(scores, sentences)
+        loss = self.calculate_loss(scores, sentences)
         return scores, loss
+
+    def obtain_performance_metric(
+            self,
+            batch,
+            scores,
+            lines,
+            metric=MetricRegression("Perf_Metric"),
+    ) -> MetricRegression:
+        true_values = []
+        for sentence in batch:
+            for label in sentence.labels:
+                true_values.append(float(label.value))
+
+        results = []
+        for score in scores:
+            if type(score[0]) is Label:
+                results.append(float(score[0].score))
+            else:
+                results.append(float(score[0]))
+
+        metric.true.extend(true_values)
+        metric.pred.extend(results)
+
+        for sentence, prediction, true_value in zip(
+                batch, results, true_values
+        ):
+            eval_line = "{}\t{}\t{}\n".format(
+                sentence.to_original_text(), true_value, prediction
+            )
+            lines.append(eval_line)
+
+        return metric
 
     def evaluate(
         self,
@@ -111,31 +143,11 @@ class TextRegressor(flair.models.TextClassifier):
 
                 scores, loss = self.forward_labels_and_loss(batch)
 
-                true_values = []
-                for sentence in batch:
-                    total_count += 1
-                    for label in sentence.labels:
-                        true_values.append(float(label.value))
-
-                results = []
-                for score in scores:
-                    if type(score[0]) is Label:
-                        results.append(float(score[0].score))
-                    else:
-                        results.append(float(score[0]))
-
                 eval_loss += loss
 
-                metric.true.extend(true_values)
-                metric.pred.extend(results)
+                metric = self.obtain_performance_metric(batch, scores, lines, metric)
 
-                for sentence, prediction, true_value in zip(
-                    batch, results, true_values
-                ):
-                    eval_line = "{}\t{}\t{}\n".format(
-                        sentence.to_original_text(), true_value, prediction
-                    )
-                    lines.append(eval_line)
+                total_count += len(batch)
 
                 store_embeddings(batch, embeddings_storage_mode)
 

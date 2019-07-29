@@ -231,6 +231,57 @@ class SequenceTagger(flair.nn.Model):
         model.load_state_dict(state["state_dict"])
         return model
 
+    def obtain_performance_metric(
+            self,
+            batch,
+            tags,
+            lines=None,
+            metric=Metric("Perf_Metric"),
+    ) -> Metric:
+
+        for (sentence, sent_tags) in zip(batch, tags):
+            for (token, tag) in zip(sentence.tokens, sent_tags):
+                token: Token = token
+                token.add_tag_label("predicted", tag)
+
+                # append both to file for evaluation
+                eval_line = "{} {} {} {}\n".format(
+                    token.text,
+                    token.get_tag(self.tag_type).value,
+                    tag.value,
+                    tag.score,
+                )
+                # if provided None, dont append to the lines
+                if isinstance(lines, List):
+                    lines.append(eval_line)
+            if isinstance(lines, List):
+                lines.append("\n")
+
+        for sentence in batch:
+            # make list of gold tags
+            gold_tags = [
+                (tag.tag, str(tag)) for tag in sentence.get_spans(self.tag_type)
+            ]
+            # make list of predicted tags
+            predicted_tags = [
+                (tag.tag, str(tag)) for tag in sentence.get_spans("predicted")
+            ]
+
+            # check for true positives, false positives and false negatives
+            for tag, prediction in predicted_tags:
+                if (tag, prediction) in gold_tags:
+                    metric.add_tp(tag)
+                else:
+                    metric.add_fp(tag)
+
+            for tag, gold in gold_tags:
+                if (tag, gold) not in predicted_tags:
+                    metric.add_fn(tag)
+                else:
+                    metric.add_tn(tag)
+
+        return metric
+
     def evaluate(
         self,
         data_loader: DataLoader,
@@ -251,47 +302,12 @@ class SequenceTagger(flair.nn.Model):
 
                 with torch.no_grad():
                     features = self.forward(batch)
-                    loss = self._calculate_loss(features, batch)
-                    tags, _ = self._obtain_labels(features, batch)
+                    loss = self.calculate_loss(features, batch)
+                    tags, _ = self.obtain_labels(features, batch)
 
                 eval_loss += loss
 
-                for (sentence, sent_tags) in zip(batch, tags):
-                    for (token, tag) in zip(sentence.tokens, sent_tags):
-                        token: Token = token
-                        token.add_tag_label("predicted", tag)
-
-                        # append both to file for evaluation
-                        eval_line = "{} {} {} {}\n".format(
-                            token.text,
-                            token.get_tag(self.tag_type).value,
-                            tag.value,
-                            tag.score,
-                        )
-                        lines.append(eval_line)
-                    lines.append("\n")
-                for sentence in batch:
-                    # make list of gold tags
-                    gold_tags = [
-                        (tag.tag, str(tag)) for tag in sentence.get_spans(self.tag_type)
-                    ]
-                    # make list of predicted tags
-                    predicted_tags = [
-                        (tag.tag, str(tag)) for tag in sentence.get_spans("predicted")
-                    ]
-
-                    # check for true positives, false positives and false negatives
-                    for tag, prediction in predicted_tags:
-                        if (tag, prediction) in gold_tags:
-                            metric.add_tp(tag)
-                        else:
-                            metric.add_fp(tag)
-
-                    for tag, gold in gold_tags:
-                        if (tag, gold) not in predicted_tags:
-                            metric.add_fn(tag)
-                        else:
-                            metric.add_tn(tag)
+                metric = self.obtain_performance_metric(batch, tags, lines, metric)
 
                 store_embeddings(batch, embeddings_storage_mode)
 
@@ -322,12 +338,6 @@ class SequenceTagger(flair.nn.Model):
             )
 
             return result, eval_loss
-
-    def forward_loss(
-        self, data_points: Union[List[Sentence], Sentence], sort=True
-    ) -> torch.tensor:
-        features = self.forward(data_points)
-        return self._calculate_loss(features, data_points)
 
     def predict(
         self,
@@ -365,7 +375,7 @@ class SequenceTagger(flair.nn.Model):
 
                 with torch.no_grad():
                     feature = self.forward(batch)
-                    tags, all_tags = self._obtain_labels(feature, batch)
+                    tags, all_tags = self.obtain_labels(feature, batch)
 
                 for (sentence, sent_tags, sent_all_tags) in zip(batch, tags, all_tags):
                     for (token, tag, token_all_tags) in zip(
@@ -494,7 +504,7 @@ class SequenceTagger(flair.nn.Model):
 
         return score
 
-    def _calculate_loss(
+    def calculate_loss(
         self, scores: torch.tensor, sentences: List[Sentence]
     ) -> torch.tensor:
 
@@ -540,7 +550,7 @@ class SequenceTagger(flair.nn.Model):
             score /= len(features)
             return score
 
-    def _obtain_labels(
+    def obtain_labels(
         self, feature, sentences
     ) -> (List[List[Label]], List[List[List[Label]]]):
         """

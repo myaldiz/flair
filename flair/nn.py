@@ -10,7 +10,8 @@ from typing import Union, List
 import flair
 from flair.data import DataPoint
 from flair.datasets import DataLoader
-from flair.training_utils import Result
+from flair.training_utils import Result, Metric
+from flair.data import Sentence
 
 
 class Model(torch.nn.Module):
@@ -18,10 +19,29 @@ class Model(torch.nn.Module):
     Every new type of model must implement these methods."""
 
     @abstractmethod
-    def forward_loss(
+    def forward(
         self, data_points: Union[List[DataPoint], DataPoint]
     ) -> torch.tensor:
-        """Performs a forward pass and returns a loss tensor for backpropagation. Implement this to enable training."""
+        """Performs a forward pass, Implement this to enable training."""
+        pass
+
+    @abstractmethod
+    def calculate_loss(
+            self, features: torch.tensor, sentences: List[Sentence]
+    ) -> torch.tensor:
+        """Calculates the loss tensor for backpropagation. Implement this to enable training."""
+        pass
+
+    @abstractmethod
+    def obtain_labels(
+            self, *args, **kwargs
+    ):
+        """Describe.."""
+        pass
+
+    @abstractmethod
+    def obtain_performance_metric(self, *args, **kwargs):
+        """Given inputs calculate perform"""
         pass
 
     @abstractmethod
