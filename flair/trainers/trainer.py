@@ -241,7 +241,7 @@ class ModelTrainer:
                     f"EPOCH {epoch + 1} done with lr {learning_rate:.4f}"
                 )
                 log.info(
-                    f"DEV : loss {train_loss} - score {train_result.main_score}"
+                    f"TRAIN : loss {train_loss} - score {train_result.main_score}"
                 )
 
                 if self.use_tensorboard:
@@ -266,7 +266,7 @@ class ModelTrainer:
                     result_line: str = ""
                     result_line += f"\t{train_eval_result.log_line}"
                     log.info(
-                        f"DEV : loss {train_loss} - score {train_eval_result.main_score}"
+                        f"TRAIN : loss {train_loss} - score {train_eval_result.main_score}"
                     )
 
                     # depending on memory mode, embeddings are moved to CPU, GPU or deleted

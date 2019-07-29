@@ -5,7 +5,6 @@ from .parameter import (
     DOCUMENT_EMBEDDING_PARAMETERS,
 )
 from .param_selection import (
-    SequenceTaggerParamSelector,
-    TextClassifierParamSelector,
+    ParamSelector,
     SearchSpace,
 )

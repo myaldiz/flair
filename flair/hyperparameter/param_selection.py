@@ -6,6 +6,8 @@ from typing import Tuple, Union
 import types
 import numpy as np
 
+import torch
+
 import ray
 from ray import tune
 from ray.tune.schedulers import HyperBandScheduler
@@ -29,6 +31,7 @@ from flair.training_utils import (
     EvaluationMetric,
     log_line,
     init_output_file,
+    WeightExtractor,
     add_file_handler,
 )
 
@@ -188,6 +191,7 @@ class TuneParamSelector(Trainable):
         args = config["args"]
         config.pop("args", None)
         self.params = config
+        self.corpus = args["corpus"]
 
         torch.manual_seed(args["seed"])
         if args.cuda:
@@ -195,26 +199,37 @@ class TuneParamSelector(Trainable):
 
         model = args["_set_up_model"](self.params)
 
-        self.trainer = ModelTrainer(model, args["corpus"])
-
         log_line(log)
         log.info(f'Model: "{self.model}"')
         log_line(log)
         log.info(f'Corpus: "{self.corpus}"')
         log_line(log)
         log.info("Parameters:")
-        log.info(f' - learning_rate: "{learning_rate}"')
-        log.info(f' - mini_batch_size: "{mini_batch_size}"')
-        log.info(f' - patience: "{patience}"')
-        log.info(f' - anneal_factor: "{anneal_factor}"')
-        log.info(f' - max_epochs: "{max_epochs}"')
-        log.info(f' - shuffle: "{shuffle}"')
+        log.info(f' - learning_rate: "{config["learning_rate"]}"')
+        # log.info(f' - mini_batch_size: "{config["mini_batch_size"]}"')
+        # log.info(f' - patience: "{config["patience"]}"')
+        # log.info(f' - anneal_factor: "{config["anneal_factor"]}"')
 
+        # Check this once more
+        weight_extractor = None  # WeightExtractor()
 
+        training_params = {
+            key: config[key] for key in config if key in TRAINING_PARAMETERS
+        }
+
+        model_trainer_parameters = {
+            key: config[key] for key in config if key in MODEL_TRAINER_PARAMETERS
+        }
+
+        # This should be enough for initializing all the parameters for the trainer
+        self.trainer = ModelTrainer(model, self.corpus, model_trainer_parameters)
 
     def _train_iteration(self):
+        trainer = self.trainer
+        trainer.train_epoch(
+            trainer.epoch,
+        )
 
-        pass
 
     def _test(self):
         pass
@@ -261,7 +276,7 @@ class DistributedParamSelector(object):
         self.config = config
         config["args"] = args
         args["cuda"] = self.use_gpu
-        args["_set_up_model"] = self._set_up_model
+        args["corpus"] = corpus
 
     def optimize(
             self,
@@ -274,7 +289,7 @@ class DistributedParamSelector(object):
         config.update(space.search_space)
         args["max_evals"] = max_evals
         args["seed"] = random_seed
-
+        args["_set_up_model"] = self._set_up_model
 
         tune.run(
             TuneParamSelector,
@@ -296,6 +311,7 @@ class DistributedParamSelector(object):
     def _set_up_model(self, params: dict) -> flair.nn.Model:
         pass
 
+
 def ParamSelector(
         corpus: Corpus,
         tag_type: str,
@@ -310,21 +326,13 @@ def ParamSelector(
         optimization_value: OptimizationValue = OptimizationValue.DEV_LOSS,
 ):
     param_selector = None
-    if distributed:
-        param_selector = DistributedParamSelector(
-            corpus, base_path,
-            evaluation_metric,
-            training_runs,
-            optimization_value
-        )
-    else:
-        param_selector = SequentialParamSelector(
-            corpus, base_path,
-            evaluation_metric,
-            training_runs,
-            optimization_value
-        )
-
+    param_selector_class = DistributedParamSelector if distributed else SequentialParamSelector
+    param_selector = param_selector_class(
+        corpus, base_path,
+        evaluation_metric,
+        training_runs,
+        optimization_value
+    )
     param_selector.model_type = model_type
 
     def _set_up_model(self, params: dict):
@@ -333,13 +341,11 @@ def ParamSelector(
             parameter_set = SEQUENCE_TAGGER_PARAMETERS
         elif self.model_type == TextClassifier:
             parameter_set = DOCUMENT_EMBEDDING_PARAMETERS
-
         model_params = {
             key: params[key] for key in params if key in parameter_set
         }
 
         if self.model_type == SequenceTagger:
-
             self.tag_type = tag_type
             self.tag_dictionary = self.corpus.make_tag_dictionary(self.tag_type)
 
@@ -349,7 +355,6 @@ def ParamSelector(
                 **model_params,
             )
         elif self.model_type == TextClassifier:
-
             self.multi_label = multi_label
             self.document_embedding_type = document_embedding_type
 
@@ -365,6 +370,10 @@ def ParamSelector(
                 multi_label=self.multi_label,
                 document_embeddings=document_embedding,
             )
+        else:
+            log.error("Unknown class type for parameter selection")
+            raise TypeError
+
         # We bind _set_up_model method to the appropriate ParamSelector class
         # specified by model_type variable
         param_selector._set_up_model = types.MethodType(_set_up_model, param_selector)
